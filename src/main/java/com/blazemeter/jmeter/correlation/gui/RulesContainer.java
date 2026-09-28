@@ -14,9 +14,11 @@ import com.blazemeter.jmeter.correlation.gui.templates.TemplateSaveFrame;
 import com.blazemeter.jmeter.correlation.gui.templates.TemplatesManagerFrame;
 import com.blazemeter.jmeter.correlation.gui.templates.UpdateRepositoriesWorker;
 import com.helger.commons.annotation.VisibleForTesting;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Graphics2D;
+import java.awt.Insets;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.image.BufferedImage;
@@ -49,6 +51,7 @@ public class RulesContainer extends JPanel implements ActionListener {
   private static final String TEMPLATE_ACTIONS_BUTTON_SUFFIX_TEXT = " Template";
   private static final String OPEN_SUGGESTIONS = "openSuggestions";
   private static final String OPEN_HISTORY = "history";
+  private static final String IMPORT_HAR = "importHar";
 
   private final CorrelationTemplatesRegistryHandler templatesRegistryHandler;
   private final CorrelationTemplatesRepositoriesRegistryHandler repositoriesRegistryHandler;
@@ -62,6 +65,7 @@ public class RulesContainer extends JPanel implements ActionListener {
   private CorrelationHistory history;
   private JCheckBox enableCorrelation;
   private Runnable onWizardDisplay;
+  private Runnable onHarImportDisplay;
   private Runnable onSuggestionsDisplay;
   private Consumer<List<CorrelationRule>> addRulesGroupConsumer;
   private Consumer<Boolean> enableCorrelationConsumer;
@@ -122,8 +126,27 @@ public class RulesContainer extends JPanel implements ActionListener {
     JButton historyButton = makeButton("history", OPEN_HISTORY);
     historyButton.setText("History");
 
-    JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.LEADING, 0, 0));
-    buttonPanel.setMinimumSize(new Dimension(100, 200));
+    JButton importHarButton = makeButton("importHar", IMPORT_HAR);
+    importHarButton.setText("Import HAR");
+    importHarButton.setToolTipText("Apply the Correlation Rules to a HAR file instead of "
+        + "recording");
+
+    /*
+     There are more buttons than fit in one row on narrow windows. A plain FlowLayout would lay
+     them out in several rows but keep the height of a single one, hiding the extra rows, so the
+     preferred height is computed from the wrapped rows.
+    */
+    JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.LEADING, 0, 0)) {
+      @Override
+      public Dimension getPreferredSize() {
+        return getWrappedSize(this);
+      }
+
+      @Override
+      public Dimension getMinimumSize() {
+        return getWrappedSize(this);
+      }
+    };
     buttonPanel.add(loadButton);
     buttonPanel.add(Box.createRigidArea(new Dimension(10, 0)));
     buttonPanel.add(exportButton);
@@ -137,7 +160,38 @@ public class RulesContainer extends JPanel implements ActionListener {
     buttonPanel.add(enableCorrelation);
     buttonPanel.add(Box.createRigidArea(new Dimension(10, 0)));
     buttonPanel.add(historyButton);
+    buttonPanel.add(Box.createRigidArea(new Dimension(10, 0)));
+    buttonPanel.add(importHarButton);
     return buttonPanel;
+  }
+
+  /**
+   * Size needed by the components of a wrapping FlowLayout panel at its current width.
+   *
+   * @param panel the panel holding the buttons
+   * @return the size needed to display every row
+   */
+  private static Dimension getWrappedSize(JPanel panel) {
+    int availableWidth = panel.getWidth() > 0 ? panel.getWidth() : MAIN_CONTAINER_WIDTH;
+    int rowWidth = 0;
+    int rowHeight = 0;
+    int totalHeight = 0;
+    int maxRowWidth = 0;
+    for (Component component : panel.getComponents()) {
+      Dimension size = component.getPreferredSize();
+      if (rowWidth > 0 && rowWidth + size.width > availableWidth) {
+        totalHeight += rowHeight;
+        maxRowWidth = Math.max(maxRowWidth, rowWidth);
+        rowWidth = 0;
+        rowHeight = 0;
+      }
+      rowWidth += size.width;
+      rowHeight = Math.max(rowHeight, size.height);
+    }
+    totalHeight += rowHeight;
+    Insets insets = panel.getInsets();
+    return new Dimension(Math.max(maxRowWidth, rowWidth) + insets.left + insets.right,
+        totalHeight + insets.top + insets.bottom);
   }
 
   private JButton makeButton(String name, String action) {
@@ -176,6 +230,11 @@ public class RulesContainer extends JPanel implements ActionListener {
         break;
       case OPEN_SUGGESTIONS:
         displayCorrelationSuggestions();
+        break;
+      case IMPORT_HAR:
+        if (onHarImportDisplay != null) {
+          onHarImportDisplay.run();
+        }
         break;
       case OPEN_HISTORY:
         if (historyFrame == null) {
@@ -314,6 +373,10 @@ public class RulesContainer extends JPanel implements ActionListener {
 
   public void setOnWizardDisplayMethod(Runnable onWizardDisplay) {
     this.onWizardDisplay = onWizardDisplay;
+  }
+
+  public void setOnHarImportDisplayMethod(Runnable onHarImportDisplay) {
+    this.onHarImportDisplay = onHarImportDisplay;
   }
 
   public void setOnSuggestionsDisplayMethod(Runnable onSuggestionsDisplay) {

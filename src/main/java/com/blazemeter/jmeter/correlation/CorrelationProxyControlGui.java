@@ -18,6 +18,7 @@ import com.blazemeter.jmeter.correlation.core.templates.repository.TemplatePrope
 import com.blazemeter.jmeter.correlation.gui.CorrelationComponentsRegistry;
 import com.blazemeter.jmeter.correlation.gui.RulesContainer;
 import com.blazemeter.jmeter.correlation.gui.automatic.CorrelationWizard;
+import com.blazemeter.jmeter.correlation.gui.har.HarImportDialog;
 import com.google.common.annotations.VisibleForTesting;
 import java.awt.BorderLayout;
 import java.awt.Component;
@@ -52,6 +53,7 @@ public class CorrelationProxyControlGui extends ProxyControlGui
   private CorrelationProxyControl model;
   private CorrelationHistory history;
   private CorrelationWizard wizard;
+  private HarImportDialog harImportDialog;
 
   static {
     LocalConfiguration.installDefaultFiles(JMeterUtils.getJMeterBinDir());
@@ -73,6 +75,7 @@ public class CorrelationProxyControlGui extends ProxyControlGui
     rulesContainer.setOnSuggestionsDisplayMethod(() -> wizard.displaySuggestions());
     rulesContainer.setEnableCorrelationConsumer((enableCorrelation)
         -> model.enableCorrelation(enableCorrelation));
+    rulesContainer.setOnHarImportDisplayMethod(this::displayHarImport);
     mainParentGuiComponent = getParent();
 
   }
@@ -127,6 +130,15 @@ public class CorrelationProxyControlGui extends ProxyControlGui
       }
     }
     super.actionPerformed(action);
+  }
+
+  private void displayHarImport() {
+    if (harImportDialog == null) {
+      harImportDialog = new HarImportDialog(getParent() != null ? getParent() : this,
+          () -> model, () -> modifyTestElement(model));
+    }
+    harImportDialog.setVisible(true);
+    harImportDialog.toFront();
   }
 
   private JTabbedPane findTabbedPane() {
