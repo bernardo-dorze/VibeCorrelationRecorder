@@ -4,6 +4,8 @@ on:
     types: [ published ]
 jobs:
   release:
+    # Only publish from the upstream repository; forks create their releases manually.
+    if: github.repository == 'Blazemeter/CorrelationRecorder'
     runs-on: ubuntu-latest
     concurrency: blazemeter_test
     steps:
