@@ -42,8 +42,10 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.security.GeneralSecurityException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -106,6 +108,10 @@ public class CorrelationProxyControl extends ProxyControl implements
       "filterContentType", SampleResult.class);
   private static final Field SERVER_FIELD = getProxyControlField("server");
   private static final Field SAMPLE_GAP_FIELD = getProxyControlField("sampleGap");
+  private static final Field SAMPLE_QUEUE_FIELD = getProxyControlField("sampleQueue");
+  private static final Field LAST_TIME_FIELD = getProxyControlField("lastTime");
+  private static final Method PUT_SAMPLES_INTO_MODEL_METHOD = getProxyControlMethod(
+      "putSamplesIntoModel", ActionEvent.class);
   private static final String PROXY_REDIRECT_DISABLING_NAME = "proxy.redirect.disabling";
   private static final String CORRELATION_PROXY_REDIRECT_DISABLING_NAME =
       "correlation.proxy.redirect.disabling";
@@ -122,6 +128,9 @@ public class CorrelationProxyControl extends ProxyControl implements
   private CorrelationHistory history;
   private Runnable onStopRecordingMethod;
   private String originalDisablingValue = null;
+  private transient volatile boolean harImportInProgress = false;
+  private transient boolean engineEnabledBeforeHarImport;
+  private transient List<RulesGroup> harImportGroups = new ArrayList<>();
 
   @SuppressWarnings("checkstyle:RedundantModifier")
   public CorrelationProxyControl() {
@@ -187,6 +196,9 @@ public class CorrelationProxyControl extends ProxyControl implements
 
   @Override
   public synchronized void startProxy() throws IOException {
+    if (harImportInProgress) {
+      throw new IOException("A HAR import is in progress, wait for it to finish before recording");
+    }
     JMeterElementUtils.setupResultCollectors(this);
     lastComparableCookies.clear();
     correlationEngine.reset();
@@ -399,7 +411,7 @@ public class CorrelationProxyControl extends ProxyControl implements
      * This forces the sampler to be added to the TestPlan.
      * Fix for issues in the recording on JMeter +5.3
      */
-    if (putSamplesIntoModel != null) {
+    if (putSamplesIntoModel != null && !harImportInProgress) {
       ActionEvent e = new ActionEvent(this, 0, "putSamplesIntoModel");
       Object reference = this;
       SwingUtilities.invokeLater(new Runnable() {
@@ -413,6 +425,236 @@ public class CorrelationProxyControl extends ProxyControl implements
       });
     }
 
+  }
+
+  /**
+   * Prepares the recorder to receive samples built from a HAR file (instead of proxied requests).
+   *
+   * <p>The correlation rules configured in the recorder are always applied (the legacy
+   * correlation engine is enabled for the import regardless of the "Legacy Correlation"
+   * checkbox), with a clean state, the same way a new recording starts.
+   *
+   * @throws IllegalStateException if the recorder is running or other import is in progress
+   */
+  public synchronized void startHarImport() {
+    if (isServerRunning()) {
+      throw new IllegalStateException("Stop the recorder before importing a HAR file");
+    }
+    if (harImportInProgress) {
+      throw new IllegalStateException("Another HAR import is already in progress");
+    }
+    ReflectionUtils.checkFields(ProxyControl.class, SAMPLE_QUEUE_FIELD, LAST_TIME_FIELD,
+        SAMPLE_GAP_FIELD);
+    ReflectionUtils.checkMethods(ProxyControl.class, PUT_SAMPLES_INTO_MODEL_METHOD);
+    syncRuntimeSettingsFromProperties();
+    if (getProxyPauseHTTPSample().isEmpty()) {
+      setSampleGap(JMeterUtils.getPropDefault("proxy.pause", 5000));
+    } else {
+      setSampleGap(Long.parseLong(getProxyPauseHTTPSample().trim()));
+    }
+    setProxyControlField(LAST_TIME_FIELD, 0L);
+    lastComparableCookies.clear();
+    pendingProxies.clear();
+    samples.clear();
+    target = null;
+
+    /*
+     The rules are rebuilt from the test element properties, and that only resolves the
+     extractor/replacement classes that the registry considers active. The classes referenced by
+     the rules are activated explicitly so a rule is never silently dropped (for instance when the
+     search of components in lib/ext did not find them).
+    */
+    // the rules are resolved against the registry singleton, which is the one to update
+    CorrelationComponentsRegistry.getInstance()
+        .updateActiveComponents(getCorrelationComponents(), getRuleComponentClasses());
+    harImportGroups = getGroups();
+    for (RulesGroup group : harImportGroups) {
+      for (CorrelationRule rule : group.getRules()) {
+        // rules built from test element properties don't have the reference variable set
+        if (rule.getCorrelationExtractor() != null) {
+          rule.getCorrelationExtractor().setVariableName(rule.getReferenceName());
+        }
+        if (rule.getCorrelationReplacement() != null) {
+          rule.getCorrelationReplacement().setVariableName(rule.getReferenceName());
+        }
+      }
+    }
+    correlationEngine.setCorrelationRules(harImportGroups, getCorrelationComponentsRegistry());
+    correlationEngine.reset();
+    engineEnabledBeforeHarImport = correlationEngine.isEnabled();
+    correlationEngine.setEnabled(true);
+    harImportInProgress = true;
+  }
+
+  /**
+   * Delivers a sample built from a HAR entry, as if it had been proxied while recording:
+   * correlation rules are applied and the sampler is queued to be added to the test plan.
+   *
+   * @param sampler sampler built from the HAR request
+   * @param testElements children of the sampler (e.g. Header Manager)
+   * @param result result built from the HAR response
+   * @param recordedAt HAR start time of the request, used for timers and grouping
+   * @return false if the sample was excluded by the recorder URL or content type filters
+   */
+  public synchronized boolean deliverHarSample(HTTPSamplerBase sampler,
+      TestElement[] testElements, SampleResult result, long recordedAt) {
+    if (!harImportInProgress) {
+      throw new IllegalStateException("startHarImport has to be invoked first");
+    }
+    PendingProxy pending = new PendingProxy(getTarget());
+    pending.update(sampler, testElements, result);
+    pending.setComplete(true);
+    boolean accepted = filter(sampler, result);
+    deliverCompletedProxy(pending);
+    if (accepted) {
+      setRecordedAtOfLastQueuedSample(sampler, recordedAt);
+    }
+    return accepted;
+  }
+
+  /**
+   * Adds the queued samplers to the test plan tree. Invoked by the HAR importer periodically and
+   * at the end of the import (from a non EDT thread it waits until the EDT adds them).
+   *
+   * @throws InterruptedException if interrupted while waiting for the EDT
+   * @throws InvocationTargetException if adding the samplers fails
+   */
+  public void flushHarSamplesIntoModel() throws InterruptedException,
+      InvocationTargetException {
+    Runnable putSamples = () -> {
+      try {
+        PUT_SAMPLES_INTO_MODEL_METHOD.invoke(this,
+            new ActionEvent(this, 0, "putSamplesIntoModel"));
+      } catch (IllegalAccessException | InvocationTargetException ex) {
+        throw new IllegalStateException("Could not add HAR samples to the test plan", ex);
+      }
+    };
+    // putSamplesIntoModel may stop early (e.g. with "store first sampler of each group only")
+    int attempts = getQueuedSamplesCount() + 1;
+    while (getQueuedSamplesCount() > 0 && attempts-- > 0) {
+      if (SwingUtilities.isEventDispatchThread()) {
+        putSamples.run();
+      } else {
+        SwingUtilities.invokeAndWait(putSamples);
+      }
+    }
+  }
+
+  public synchronized void endHarImport() {
+    if (harImportInProgress) {
+      harImportInProgress = false;
+      correlationEngine.setEnabled(engineEnabledBeforeHarImport);
+      // restores the components activated for the import
+      CorrelationComponentsRegistry.getInstance()
+          .updateActiveComponents(getCorrelationComponents(), new ArrayList<>());
+    }
+  }
+
+  /**
+   * Names of the extractor and replacement classes referenced by the configured rules.
+   *
+   * @return the class names used by the rules
+   */
+  private List<String> getRuleComponentClasses() {
+    List<String> classes = new ArrayList<>();
+    for (CorrelationRuleTestElement rule : getRuleTestElements()) {
+      Class<?> extractor = rule.getExtractorClass();
+      Class<?> replacement = rule.getReplacementClass();
+      for (Class<?> component : Arrays.asList(extractor, replacement)) {
+        if (component != null && !classes.contains(component.getCanonicalName())) {
+          classes.add(component.getCanonicalName());
+        }
+      }
+    }
+    return classes;
+  }
+
+  private List<CorrelationRuleTestElement> getRuleTestElements() {
+    List<CorrelationRuleTestElement> rules = new ArrayList<>();
+    JMeterProperty groups = getProperty(CORRELATION_GROUPS);
+    if (groups instanceof CollectionProperty) {
+      ((CollectionProperty) groups).forEach(group -> {
+        Object value = group.getObjectValue();
+        if (value instanceof RulesGroupTestElement) {
+          rules.addAll(((RulesGroupTestElement) value).getRulesGroupsProperty().getRules());
+        }
+      });
+      return rules;
+    }
+    CorrelationRulesTestElement legacyRules = getCorrelationRulesTestElement();
+    if (legacyRules != null) {
+      rules.addAll(legacyRules.getRules());
+    }
+    return rules;
+  }
+
+  public boolean isHarImportInProgress() {
+    return harImportInProgress;
+  }
+
+  /**
+   * Rules used by the last HAR import.
+   *
+   * @return the groups used in last (or current) HAR import
+   */
+  public List<RulesGroup> getHarImportGroups() {
+    return harImportGroups;
+  }
+
+  public boolean isServerRunning() {
+    try {
+      return SERVER_FIELD.get(this) != null;
+    } catch (IllegalAccessException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  /*
+   * JMeter only updates these fields through the setters (invoked by the GUI). When the test
+   * plan is loaded from a file without GUI only the properties are set, so we sync them.
+   */
+  private void syncRuntimeSettingsFromProperties() {
+    setGroupingMode(getGroupingMode());
+    setAssertions(getAssertions());
+    setSamplerRedirectAutomatically(getSamplerRedirectAutomatically());
+    setSamplerFollowRedirects(getSamplerFollowRedirects());
+    setUseKeepAlive(getUseKeepalive());
+    setSamplerDownloadImages(getSamplerDownloadImages());
+    setNotifyChildSamplerListenerOfFilteredSamplers(
+        getNotifyChildSamplerListenerOfFilteredSamplers());
+    setRegexMatch(getRegexMatch());
+  }
+
+  private int getQueuedSamplesCount() {
+    try {
+      return ((Collection<?>) SAMPLE_QUEUE_FIELD.get(this)).size();
+    } catch (IllegalAccessException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void setRecordedAtOfLastQueuedSample(HTTPSamplerBase sampler, long recordedAt) {
+    try {
+      Object info = ((ArrayDeque<?>) SAMPLE_QUEUE_FIELD.get(this)).peekLast();
+      if (info == null) {
+        return;
+      }
+      Field samplerField = ReflectionUtils.getField(info.getClass(), "sampler");
+      Field recordedAtField = ReflectionUtils.getField(info.getClass(), "recordedAt");
+      if (samplerField != null && recordedAtField != null && samplerField.get(info) == sampler) {
+        recordedAtField.set(info, recordedAt);
+      }
+    } catch (IllegalAccessException e) {
+      LOG.warn("Could not set recording time of sampler {}", sampler.getName(), e);
+    }
+  }
+
+  private void setProxyControlField(Field field, Object value) {
+    try {
+      field.set(this, value);
+    } catch (IllegalAccessException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private boolean filter(HTTPSamplerBase sampler, SampleResult result) {
@@ -848,6 +1090,7 @@ public class CorrelationProxyControl extends ProxyControl implements
   private void readObject(ObjectInputStream inputStream)
       throws IOException, ClassNotFoundException {
     inputStream.defaultReadObject();
+    harImportGroups = new ArrayList<>();
     correlationEngine = new CorrelationEngine();
     componentsRegistry = CorrelationComponentsRegistry.getInstance();
     localConfiguration = new LocalConfiguration(getTemplateDirectoryPath());

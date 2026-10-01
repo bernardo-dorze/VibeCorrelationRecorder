@@ -245,3 +245,8 @@ dist
 config.local.js
 basement_dist
 
+
+# Fork addition: the built plugin jar is published in dist/ for convenience
+!/dist/
+!/dist/*.jar
+!/dist/*.md

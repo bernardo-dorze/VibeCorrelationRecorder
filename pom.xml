@@ -6,9 +6,9 @@
   <groupId>com.blazemeter</groupId>
   <artifactId>jmeter-bzm-correlation-recorder</artifactId>
   <packaging>jar</packaging>
-  <version>3.1.1</version>
+  <version>3.1.1-har.1</version>
   <name>Auto Correlation Recorder</name>
-  <description>Auto Correlation Recorder as JMeter Plugin</description>
+  <description>Auto Correlation Recorder as JMeter Plugin (fork with HAR import for legacy correlation rules)</description>
   <url>https://github.com/Blazemeter/CorrelationRecorder</url>
 
   <licenses>

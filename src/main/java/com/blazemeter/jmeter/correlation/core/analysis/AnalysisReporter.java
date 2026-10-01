@@ -215,6 +215,10 @@ public class AnalysisReporter {
 
     private List<ReportEntry> entries;
 
+    public int getEntriesCount() {
+      return entries == null ? 0 : entries.size();
+    }
+
     @Override
     public String toString() {
       return "Part can be applied to " + entries.size() + " elements.\n"
